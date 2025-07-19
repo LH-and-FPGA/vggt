@@ -1,0 +1,502 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+import random
+import numpy as np
+import glob
+import os
+import copy
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.nn.parallel import DataParallel
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Configure CUDA settings
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+
+import argparse
+from pathlib import Path
+import trimesh
+import pycolmap
+import cv2
+import shutil
+from datetime import datetime
+
+
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import load_and_preprocess_images_square
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
+from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
+from vggt.dependency.track_predict import predict_tracks
+from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
+
+
+# TODO: add support for masks
+# TODO: add iterative BA
+# TODO: add support for radial distortion, which needs extra_params
+# TODO: test with more cases
+# TODO: test different camera types
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="VGGT Demo with Multi-GPU Support")
+    
+    # Input options: either scene_dir or local model path
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--scene_dir", type=str, help="Directory containing the scene images")
+    input_group.add_argument("--local_model_path", type=str, help="Path to local model file")
+    
+    # Additional scene dir for local model (required when using local model)
+    parser.add_argument("--images_dir", type=str, help="Directory containing images (required with --local_model_path)")
+    
+    # Video input option
+    parser.add_argument("--video_path", type=str, help="Path to input video file")
+    parser.add_argument("--fps_sample", type=float, default=1.0, help="Sample rate for video frames (frames per second)")
+    parser.add_argument("--max_frames", type=int, default=None, help="Maximum number of frames to extract from video")
+    
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
+    
+    # Multi-GPU options
+    parser.add_argument("--use_multi_gpu", action="store_true", default=False, help="Use multiple GPUs if available")
+    parser.add_argument("--gpu_ids", type=str, default=None, help="Comma-separated GPU IDs to use (e.g., '0,1')")
+    
+    ######### BA parameters #########
+    parser.add_argument(
+        "--max_reproj_error", type=float, default=8.0, help="Maximum reprojection error for reconstruction"
+    )
+    parser.add_argument("--shared_camera", action="store_true", default=False, help="Use shared camera for all images")
+    parser.add_argument("--camera_type", type=str, default="SIMPLE_PINHOLE", help="Camera type for reconstruction")
+    parser.add_argument("--vis_thresh", type=float, default=0.2, help="Visibility threshold for tracks")
+    parser.add_argument("--query_frame_num", type=int, default=8, help="Number of frames to query")
+    parser.add_argument("--max_query_pts", type=int, default=4096, help="Maximum number of query points")
+    parser.add_argument(
+        "--fine_tracking", action="store_true", default=True, help="Use fine tracking (slower but more accurate)"
+    )
+    parser.add_argument(
+        "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
+    )
+    return parser.parse_args()
+
+
+def extract_frames_from_video(video_path, output_dir, fps_sample=1.0, max_frames=None):
+    """Extract frames from video file
+    
+    Args:
+        video_path: Path to video file
+        output_dir: Directory to save extracted frames
+        fps_sample: Sample rate for frames (frames per second to extract)
+        max_frames: Maximum number of frames to extract
+        
+    Returns:
+        List of extracted frame paths
+    """
+    print(f"Extracting frames from video: {video_path}")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Open video
+    vs = cv2.VideoCapture(video_path)
+    fps = vs.get(cv2.CAP_PROP_FPS)
+    total_frames = int(vs.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f"Video FPS: {fps}, Total frames: {total_frames}")
+    
+    # Calculate frame interval based on desired fps_sample
+    frame_interval = int(fps / fps_sample) if fps_sample < fps else 1
+    
+    print(f"Extracting 1 frame every {frame_interval} frames ({fps_sample} FPS)")
+    
+    frame_count = 0
+    extracted_count = 0
+    frame_paths = []
+    
+    while True:
+        gotit, frame = vs.read()
+        if not gotit:
+            break
+            
+        # Check if we should save this frame
+        if frame_count % frame_interval == 0:
+            frame_path = os.path.join(output_dir, f"frame_{extracted_count:06d}.png")
+            cv2.imwrite(frame_path, frame)
+            frame_paths.append(frame_path)
+            extracted_count += 1
+            
+            # Check if we've reached max_frames
+            if max_frames and extracted_count >= max_frames:
+                break
+                
+        frame_count += 1
+    
+    vs.release()
+    print(f"Extracted {extracted_count} frames to {output_dir}")
+    
+    return sorted(frame_paths)
+
+
+def setup_multi_gpu(gpu_ids=None):
+    """Setup multi-GPU environment"""
+    if gpu_ids is not None:
+        # Use specified GPUs
+        gpu_list = [int(x) for x in gpu_ids.split(',')]
+        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
+        return gpu_list
+    else:
+        # Use all available GPUs
+        gpu_count = torch.cuda.device_count()
+        return list(range(gpu_count))
+
+
+def load_model(args, device):
+    """Load model with support for local files and multi-GPU"""
+    model = VGGT()
+    
+    # Load model weights
+    if args.local_model_path:
+        print(f"Loading model from local path: {args.local_model_path}")
+        if args.local_model_path.endswith('.pt'):
+            state_dict = torch.load(args.local_model_path, map_location='cpu')
+        else:
+            raise ValueError("Local model file must be a .pt file")
+        model.load_state_dict(state_dict)
+    else:
+        print("Loading model from HuggingFace...")
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    
+    model.eval()
+    
+    # Multi-GPU setup
+    if args.use_multi_gpu and torch.cuda.device_count() > 1:
+        gpu_ids = setup_multi_gpu(args.gpu_ids)
+        print(f"Using {len(gpu_ids)} GPUs: {gpu_ids}")
+        
+        # Use DataParallel for simplicity (can switch to DDP for better performance)
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        model = model.to(f'cuda:{gpu_ids[0]}')
+        return model, f'cuda:{gpu_ids[0]}'
+    else:
+        model = model.to(device)
+        return model, device
+
+
+def run_VGGT(model, images, dtype, resolution=518, is_multi_gpu=False):
+    # images: [B, 3, H, W]
+
+    assert len(images.shape) == 4
+    assert images.shape[1] == 3
+
+    # hard-coded to use 518 for VGGT
+    images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
+
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(dtype=dtype):
+            images = images[None]  # add batch dimension
+            
+            if is_multi_gpu and hasattr(model, 'module'):
+                # Access the actual model when using DataParallel
+                aggregated_tokens_list, ps_idx = model.module.aggregator(images)
+            else:
+                aggregated_tokens_list, ps_idx = model.aggregator(images)
+
+        # Predict Cameras
+        if is_multi_gpu and hasattr(model, 'module'):
+            pose_enc = model.module.camera_head(aggregated_tokens_list)[-1]
+        else:
+            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+            
+        # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+        
+        # Predict Depth Maps
+        if is_multi_gpu and hasattr(model, 'module'):
+            depth_map, depth_conf = model.module.depth_head(aggregated_tokens_list, images, ps_idx)
+        else:
+            depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+
+    extrinsic = extrinsic.squeeze(0).cpu().numpy()
+    intrinsic = intrinsic.squeeze(0).cpu().numpy()
+    depth_map = depth_map.squeeze(0).cpu().numpy()
+    depth_conf = depth_conf.squeeze(0).cpu().numpy()
+    return extrinsic, intrinsic, depth_map, depth_conf
+
+
+def demo_fn(args):
+    # Print configuration
+    print("Arguments:", vars(args))
+    
+    # Validate arguments
+    if args.local_model_path and not args.images_dir:
+        raise ValueError("--images_dir is required when using --local_model_path")
+
+    # Set seed for reproducibility
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)  # for multi-GPU
+    print(f"Setting seed as: {args.seed}")
+
+    # Set device and dtype
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    print(f"Using dtype: {dtype}")
+    
+    # Check available GPUs
+    if torch.cuda.is_available():
+        print(f"Available GPUs: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+
+    # Load model with multi-GPU support
+    model, device = load_model(args, device)
+    print(f"Model loaded")
+    
+    # Determine scene directory
+    if args.scene_dir:
+        scene_dir = args.scene_dir
+        image_dir = os.path.join(scene_dir, "images")
+    else:
+        # Using local model path
+        scene_dir = os.path.dirname(args.images_dir)
+        image_dir = args.images_dir
+
+    # Get image paths and preprocess them
+    image_path_list = glob.glob(os.path.join(image_dir, "*"))
+    if len(image_path_list) == 0:
+        raise ValueError(f"No images found in {image_dir}")
+    base_image_path_list = [os.path.basename(path) for path in image_path_list]
+
+    # Load images and original coordinates
+    # Load Image in 1024, while running VGGT with 518
+    vggt_fixed_resolution = 518
+    img_load_resolution = 1024
+
+    images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
+    images = images.to(device)
+    original_coords = original_coords.to(device)
+    print(f"Loaded {len(images)} images from {image_dir}")
+
+    # Run VGGT to estimate camera and depth
+    # Run with 518x518 images
+    is_multi_gpu = args.use_multi_gpu and torch.cuda.device_count() > 1
+    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution, is_multi_gpu)
+    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+
+    if args.use_ba:
+        image_size = np.array(images.shape[-2:])
+        scale = img_load_resolution / vggt_fixed_resolution
+        shared_camera = args.shared_camera
+
+        with torch.cuda.amp.autocast(dtype=dtype):
+            # Predicting Tracks
+            # Using VGGSfM tracker instead of VGGT tracker for efficiency
+            # VGGT tracker requires multiple backbone runs to query different frames (this is a problem caused by the training process)
+            # Will be fixed in VGGT v2
+
+            # You can also change the pred_tracks to tracks from any other methods
+            # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
+            pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
+                images,
+                conf=depth_conf,
+                points_3d=points_3d,
+                masks=None,
+                max_query_pts=args.max_query_pts,
+                query_frame_num=args.query_frame_num,
+                keypoint_extractor="aliked+sp",
+                fine_tracking=args.fine_tracking,
+            )
+
+            torch.cuda.empty_cache()
+
+        # rescale the intrinsic matrix from 518 to 1024
+        intrinsic[:, :2, :] *= scale
+        track_mask = pred_vis_scores > args.vis_thresh
+
+        # TODO: radial distortion, iterative BA, masks
+        reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
+            points_3d,
+            extrinsic,
+            intrinsic,
+            pred_tracks,
+            image_size,
+            masks=track_mask,
+            max_reproj_error=args.max_reproj_error,
+            shared_camera=shared_camera,
+            camera_type=args.camera_type,
+            points_rgb=points_rgb,
+        )
+
+        if reconstruction is None:
+            raise ValueError("No reconstruction can be built with BA")
+
+        # Bundle Adjustment
+        ba_options = pycolmap.BundleAdjustmentOptions()
+        pycolmap.bundle_adjustment(reconstruction, ba_options)
+
+        reconstruction_resolution = img_load_resolution
+    else:
+        conf_thres_value = args.conf_thres_value
+        max_points_for_colmap = 100000  # randomly sample 3D points
+        shared_camera = False  # in the feedforward manner, we do not support shared camera
+        camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
+
+        image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+        num_frames, height, width, _ = points_3d.shape
+
+        points_rgb = F.interpolate(
+            images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
+        )
+        points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
+        points_rgb = points_rgb.transpose(0, 2, 3, 1)
+
+        # (S, H, W, 3), with x, y coordinates and frame indices
+        points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
+
+        conf_mask = depth_conf >= conf_thres_value
+        # at most writing 100000 3d points to colmap reconstruction object
+        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+
+        points_3d = points_3d[conf_mask]
+        points_xyf = points_xyf[conf_mask]
+        points_rgb = points_rgb[conf_mask]
+
+        print("Converting to COLMAP format")
+        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
+            points_3d,
+            points_xyf,
+            points_rgb,
+            extrinsic,
+            intrinsic,
+            image_size,
+            shared_camera=shared_camera,
+            camera_type=camera_type,
+        )
+
+        reconstruction_resolution = vggt_fixed_resolution
+
+    reconstruction = rename_colmap_recons_and_rescale_camera(
+        reconstruction,
+        base_image_path_list,
+        original_coords.cpu().numpy(),
+        img_size=reconstruction_resolution,
+        shift_point2d_to_original_res=True,
+        shared_camera=shared_camera,
+    )
+
+    print(f"Saving reconstruction to {scene_dir}/sparse")
+    sparse_reconstruction_dir = os.path.join(scene_dir, "sparse")
+    os.makedirs(sparse_reconstruction_dir, exist_ok=True)
+    reconstruction.write(sparse_reconstruction_dir)
+
+    # Save point cloud for fast visualization
+    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(scene_dir, "sparse/points.ply"))
+
+    return True
+
+
+def rename_colmap_recons_and_rescale_camera(
+    reconstruction, image_paths, original_coords, img_size, shift_point2d_to_original_res=False, shared_camera=False
+):
+    rescale_camera = True
+
+    for pyimageid in reconstruction.images:
+        # Reshaped the padded&resized image to the original size
+        # Rename the images to the original names
+        pyimage = reconstruction.images[pyimageid]
+        pycamera = reconstruction.cameras[pyimage.camera_id]
+        pyimage.name = image_paths[pyimageid - 1]
+
+        if rescale_camera:
+            # Rescale the camera parameters
+            pred_params = copy.deepcopy(pycamera.params)
+
+            real_image_size = original_coords[pyimageid - 1, -2:]
+            resize_ratio = max(real_image_size) / img_size
+            pred_params = pred_params * resize_ratio
+            real_pp = real_image_size / 2
+            pred_params[-2:] = real_pp  # center of the image
+
+            pycamera.params = pred_params
+            pycamera.width = real_image_size[0]
+            pycamera.height = real_image_size[1]
+
+        if shift_point2d_to_original_res:
+            # Also shift the point2D to original resolution
+            top_left = original_coords[pyimageid - 1, :2]
+
+            for point2D in pyimage.points2D:
+                point2D.xy = (point2D.xy - top_left) * resize_ratio
+
+        if shared_camera:
+            # If shared_camera, all images share the same camera
+            # no need to rescale any more
+            rescale_camera = False
+
+    return reconstruction
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    with torch.no_grad():
+        demo_fn(args)
+
+
+# Work in Progress (WIP)
+
+"""
+VGGT Runner Script with Multi-GPU Support
+=========================================
+
+A script to run the VGGT model for 3D reconstruction from image sequences with multi-GPU support.
+
+Usage Examples
+--------------
+1. Original usage (upload from URL):
+   python demo_colmap_multi_gpu.py --scene_dir /path/to/scene
+
+2. Local model file:
+   python demo_colmap_multi_gpu.py --local_model_path /path/to/model.pt --images_dir /path/to/images
+
+3. Multi-GPU support (all GPUs):
+   python demo_colmap_multi_gpu.py --scene_dir /path/to/scene --use_multi_gpu
+
+4. Multi-GPU with specific GPUs:
+   python demo_colmap_multi_gpu.py --scene_dir /path/to/scene --use_multi_gpu --gpu_ids "0,1"
+
+Directory Structure
+------------------
+Input:
+    input_folder/
+    └── images/            # Source images for reconstruction
+
+Output:
+    output_folder/
+    ├── images/
+    ├── sparse/           # Reconstruction results
+    │   ├── cameras.bin   # Camera parameters (COLMAP format)
+    │   ├── images.bin    # Pose for each image (COLMAP format)
+    │   ├── points3D.bin  # 3D points (COLMAP format)
+    │   └── points.ply    # Point cloud visualization file 
+    └── visuals/          # Visualization outputs TODO
+
+Key Features
+-----------
+• Dual-mode Support: Run reconstructions using either VGGT or VGGT+BA
+• Multi-GPU Support: Utilize multiple GPUs for faster processing
+• Local Model Loading: Support for loading models from local filesystem
+• Resolution Preservation: Maintains original image resolution in camera parameters and tracks
+• COLMAP Compatibility: Exports results in standard COLMAP sparse reconstruction format
+"""

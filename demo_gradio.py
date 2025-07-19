@@ -7,6 +7,7 @@
 import os
 import cv2
 import torch
+import torch.nn as nn
 import numpy as np
 import gradio as gr
 import sys
@@ -24,6 +25,15 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 
+# Check for available GPUs
+if torch.cuda.is_available():
+    gpu_count = torch.cuda.device_count()
+    print(f"Found {gpu_count} GPUs available")
+    for i in range(gpu_count):
+        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+else:
+    print("No GPUs available, using CPU")
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print("Initializing and loading VGGT model...")
@@ -33,9 +43,15 @@ model = VGGT()
 _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
 model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 
-
 model.eval()
-model = model.to(device)
+
+# Multi-GPU setup
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+    model = nn.DataParallel(model)
+    model = model.to(device)
+else:
+    model = model.to(device)
 
 
 # -------------------------------------------------------------------------
@@ -52,8 +68,7 @@ def run_model(target_dir, model) -> dict:
     if not torch.cuda.is_available():
         raise ValueError("CUDA is not available. Check your environment.")
 
-    # Move model to device
-    model = model.to(device)
+    # Model is already on device, no need to move it again
     model.eval()
 
     # Load and preprocess images
@@ -72,7 +87,13 @@ def run_model(target_dir, model) -> dict:
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+            # Handle multi-GPU case
+            if hasattr(model, 'module'):
+                # DataParallel case
+                predictions = model(images)
+            else:
+                # Single GPU case
+                predictions = model(images)
 
     # Convert pose encoding to extrinsic and intrinsic matrices
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
@@ -98,7 +119,85 @@ def run_model(target_dir, model) -> dict:
 
 
 # -------------------------------------------------------------------------
-# 2) Handle uploaded video/images --> produce target_dir + images
+# 2) Handle local file paths
+# -------------------------------------------------------------------------
+def handle_local_path(local_path):
+    """
+    Handle local file path input - can be a directory with images or a video file.
+    Return (target_dir, image_paths).
+    """
+    if not local_path or local_path.strip() == "":
+        return None, None
+    
+    local_path = local_path.strip()
+    
+    # Check if path exists
+    if not os.path.exists(local_path):
+        return None, None
+    
+    # Create a unique folder name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target_dir = f"input_images_{timestamp}"
+    target_dir_images = os.path.join(target_dir, "images")
+    
+    # Clean up if somehow that folder already exists
+    if os.path.exists(target_dir):
+        shutil.rmtree(target_dir)
+    os.makedirs(target_dir)
+    os.makedirs(target_dir_images)
+    
+    image_paths = []
+    
+    # Check if it's a directory
+    if os.path.isdir(local_path):
+        # Look for images in the directory
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif']
+        for ext in image_extensions:
+            image_files = glob.glob(os.path.join(local_path, ext))
+            image_files.extend(glob.glob(os.path.join(local_path, ext.upper())))
+            
+            for img_file in image_files:
+                dst_path = os.path.join(target_dir_images, os.path.basename(img_file))
+                shutil.copy(img_file, dst_path)
+                image_paths.append(dst_path)
+    
+    # Check if it's a video file
+    elif os.path.isfile(local_path):
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
+        if any(local_path.lower().endswith(ext) for ext in video_extensions):
+            # Extract frames from video
+            vs = cv2.VideoCapture(local_path)
+            fps = vs.get(cv2.CAP_PROP_FPS)
+            frame_interval = int(fps * 1)  # 1 frame/sec
+            
+            count = 0
+            video_frame_num = 0
+            while True:
+                gotit, frame = vs.read()
+                if not gotit:
+                    break
+                count += 1
+                if count % frame_interval == 0:
+                    image_path = os.path.join(target_dir_images, f"{video_frame_num:06}.png")
+                    cv2.imwrite(image_path, frame)
+                    image_paths.append(image_path)
+                    video_frame_num += 1
+            
+            vs.release()
+    
+    # Sort final images
+    image_paths = sorted(image_paths)
+    
+    if len(image_paths) == 0:
+        # No valid images found, cleanup
+        shutil.rmtree(target_dir)
+        return None, None
+    
+    print(f"Loaded {len(image_paths)} images from local path: {local_path}")
+    return target_dir, image_paths
+
+# -------------------------------------------------------------------------
+# 3) Handle uploaded video/images --> produce target_dir + images
 # -------------------------------------------------------------------------
 def handle_uploads(input_video, input_images):
     """
@@ -166,9 +265,32 @@ def handle_uploads(input_video, input_images):
 
 
 # -------------------------------------------------------------------------
-# 3) Update gallery on upload
+# 4) Update gallery on upload or local path
 # -------------------------------------------------------------------------
-def update_gallery_on_upload(input_video, input_images):
+def update_gallery_on_upload(input_video, input_images, local_path):
+    """
+    Whenever user uploads files or enters local path, handle them
+    and show in the gallery. Local path takes precedence.
+    """
+    # Check local path first
+    if local_path and local_path.strip():
+        target_dir, image_paths = handle_local_path(local_path)
+        if target_dir and image_paths:
+            return None, target_dir, image_paths, "Local files loaded. Click 'Reconstruct' to begin 3D processing."
+        else:
+            return None, None, None, "Invalid local path or no images found."
+    
+    # Then check uploads
+    if not input_video and not input_images:
+        return None, None, None, None
+    
+    target_dir, image_paths = handle_uploads(input_video, input_images)
+    return None, target_dir, image_paths, "Upload complete. Click 'Reconstruct' to begin 3D processing."
+
+# -------------------------------------------------------------------------
+# 5) Update gallery on upload (original function)
+# -------------------------------------------------------------------------
+def update_gallery_on_upload_original(input_video, input_images):
     """
     Whenever user uploads or changes files, immediately handle them
     and show in the gallery. Return (target_dir, image_paths).
@@ -181,7 +303,7 @@ def update_gallery_on_upload(input_video, input_images):
 
 
 # -------------------------------------------------------------------------
-# 4) Reconstruction: uses the target_dir plus any viz parameters
+# 6) Reconstruction: uses the target_dir plus any viz parameters
 # -------------------------------------------------------------------------
 def gradio_demo(
     target_dir,
@@ -254,7 +376,7 @@ def gradio_demo(
 
 
 # -------------------------------------------------------------------------
-# 5) Helper functions for UI resets + re-visualization
+# 7) Helper functions for UI resets + re-visualization
 # -------------------------------------------------------------------------
 def clear_fields():
     """
@@ -394,20 +516,31 @@ with gr.Blocks(
     is_example = gr.Textbox(label="is_example", visible=False, value="None")
     num_images = gr.Textbox(label="num_images", visible=False, value="None")
 
+    # Get GPU information
+    gpu_info_html = ""
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        gpu_info_html = f"<p style='color: #10b981; font-weight: bold;'>🖥️ Using {gpu_count} GPU{'s' if gpu_count > 1 else ''}: "
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
+        gpu_info_html += ", ".join(gpu_names) + "</p>"
+    else:
+        gpu_info_html = "<p style='color: #ef4444; font-weight: bold;'>⚠️ No GPU detected, using CPU (slower performance)</p>"
+    
     gr.HTML(
-        """
+        f"""
     <h1>🏛️ VGGT: Visual Geometry Grounded Transformer</h1>
     <p>
     <a href="https://github.com/facebookresearch/vggt">🐙 GitHub Repository</a> |
     <a href="#">Project Page</a>
     </p>
+    {gpu_info_html}
 
     <div style="font-size: 16px; line-height: 1.5;">
     <p>Upload a video or a set of images to create a 3D reconstruction of a scene or object. VGGT takes these images and generates a 3D point cloud, along with estimated camera poses.</p>
 
     <h3>Getting Started:</h3>
     <ol>
-        <li><strong>Upload Your Data:</strong> Use the "Upload Video" or "Upload Images" buttons on the left to provide your input. Videos will be automatically split into individual frames (one frame per second).</li>
+        <li><strong>Upload Your Data:</strong> Use the "Upload Video" or "Upload Images" buttons on the left to provide your input, or use the "Local Path" tab to load files from your local filesystem. Videos will be automatically split into individual frames (one frame per second).</li>
         <li><strong>Preview:</strong> Your uploaded images will appear in the gallery on the left.</li>
         <li><strong>Reconstruct:</strong> Click the "Reconstruct" button to start the 3D reconstruction process.</li>
         <li><strong>Visualize:</strong> The 3D reconstruction will appear in the viewer on the right. You can rotate, pan, and zoom to explore the model, and download the GLB file. Note the visualization of 3D points may be slow for a large number of input images.</li>
@@ -435,8 +568,19 @@ with gr.Blocks(
 
     with gr.Row():
         with gr.Column(scale=2):
-            input_video = gr.Video(label="Upload Video", interactive=True)
-            input_images = gr.File(file_count="multiple", label="Upload Images", interactive=True)
+            # Tab for different input methods
+            with gr.Tab("Upload Files"):
+                input_video = gr.Video(label="Upload Video", interactive=True)
+                input_images = gr.File(file_count="multiple", label="Upload Images", interactive=True)
+            
+            with gr.Tab("Local Path"):
+                local_path_input = gr.Textbox(
+                    label="Local File Path",
+                    placeholder="Enter path to local directory with images or video file (e.g., C:\\Users\\name\\images or /home/user/video.mp4)",
+                    lines=1,
+                    interactive=True
+                )
+                local_path_btn = gr.Button("Load from Local Path", scale=1)
 
             image_gallery = gr.Gallery(
                 label="Preview",
@@ -458,7 +602,7 @@ with gr.Blocks(
             with gr.Row():
                 submit_btn = gr.Button("Reconstruct", scale=1, variant="primary")
                 clear_btn = gr.ClearButton(
-                    [input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery],
+                    [input_video, input_images, local_path_input, reconstruction_output, log_output, target_dir_output, image_gallery],
                     scale=1,
                 )
 
@@ -678,13 +822,20 @@ with gr.Blocks(
     # Auto-update gallery whenever user uploads or changes their files
     # -------------------------------------------------------------------------
     input_video.change(
-        fn=update_gallery_on_upload,
+        fn=update_gallery_on_upload_original,
         inputs=[input_video, input_images],
         outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
     )
     input_images.change(
-        fn=update_gallery_on_upload,
+        fn=update_gallery_on_upload_original,
         inputs=[input_video, input_images],
+        outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
+    )
+    
+    # Handle local path button
+    local_path_btn.click(
+        fn=update_gallery_on_upload,
+        inputs=[input_video, input_images, local_path_input],
         outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
     )
 
